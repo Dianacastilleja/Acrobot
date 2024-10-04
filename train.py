@@ -1,184 +1,141 @@
 import gymnasium as gym
-import numpy as np
 import torch
-import torch.nn as nn
-import torch.optim as optim
-import random
+import torch.nn.functional as F
+import numpy as np
 from collections import deque
+import random
 from torch.utils.tensorboard import SummaryWriter
 
-# Define the Q-network
-class DQN(nn.Module):
-    def __init__(self, input_dim, output_dim):
-        super(DQN, self).__init__()
-        self.fc1 = nn.Linear(input_dim, 128)
-        self.fc2 = nn.Linear(128, 128)
-        self.fc3 = nn.Linear(128, output_dim)
-
+# Neural Network for the DQN
+class DQNAgent(torch.nn.Module):
+    def __init__(self, state_size, action_size):
+        super(DQNAgent, self).__init__()
+        self.fc1 = torch.nn.Linear(state_size, 256)
+        self.fc2 = torch.nn.Linear(256, 256)
+        self.fc3 = torch.nn.Linear(256, action_size)
+    
     def forward(self, x):
-        x = torch.relu(self.fc1(x))
-        x = torch.relu(self.fc2(x))
+        x = torch.nn.functional.relu(self.fc1(x))
+        x = torch.nn.functional.relu(self.fc2(x))
         return self.fc3(x)
 
-# Experience Replay Buffer
+# Replay buffer to store experiences
 class ReplayBuffer:
-    def __init__(self, capacity):
-        self.buffer = deque(maxlen=capacity)
+    def __init__(self, buffer_size):
+        self.memory = deque(maxlen=buffer_size)
 
-    def push(self, state, action, reward, next_state, done):
-        self.buffer.append((state, action, reward, next_state, done))
+    def add(self, experience):
+        self.memory.append(experience)
 
     def sample(self, batch_size):
-        state, action, reward, next_state, done = zip(*random.sample(self.buffer, batch_size))
-        return np.stack(state), action, reward, np.stack(next_state), done
+        return random.sample(self.memory, batch_size)
 
     def __len__(self):
-        return len(self.buffer)
+        return len(self.memory)
 
-# Epsilon-greedy action selection with noise
-def select_action(state, policy_net, epsilon, env):
-    if random.random() < epsilon:
-        return env.action_space.sample()  # Exploration: random action
+# Epsilon-greedy policy for action selection
+def select_action(agent, state, epsilon):
+    if np.random.rand() <= epsilon:
+        return random.randrange(action_size)  # Random action for exploration
     else:
-        # Exploitation: choose the best action, with added noise for exploration
         state_tensor = torch.tensor(state, dtype=torch.float32).unsqueeze(0)
-        q_values = policy_net(state_tensor)
-        action = q_values.max(1)[1].item()
+        with torch.no_grad():
+            q_values = agent(state_tensor)
+        return q_values.argmax().item()  # Best action
 
-        # Add some random noise to encourage exploration
-        noise = np.random.normal(0, 0.1)
-        noisy_action = min(max(int(action + noise), 0), env.action_space.n - 1)
+# Function to apply action scaling
+def apply_action(action):
+    return action  # Action values are already discrete: [-1, 0, 1]
 
-        return noisy_action
+# Hyperparameters
+state_size = 6
+action_size = 3
+batch_size = 256
+gamma = 0.99
+epsilon = 1.0
+epsilon_min = 0.01
+epsilon_decay = 0.998  # Slowed down decay rate
+learning_rate = 0.0005  # Reduced learning rate
+buffer_size = 200000
+sync_target_steps = 50
+max_episode_length = 500
 
-# Optimize the model
-def optimize_model(memory, policy_net, target_net, optimizer):
-    if len(memory) < 64:  # Batch size
-        return
+# Initialize environment, agent, target network, replay buffer, and TensorBoard writer
+env = gym.make('Acrobot-v1')
+agent = DQNAgent(state_size, action_size)
+target_agent = DQNAgent(state_size, action_size)
+target_agent.load_state_dict(agent.state_dict())  # Copy weights initially
+optimizer = torch.optim.Adam(agent.parameters(), lr=learning_rate)
+replay_buffer = ReplayBuffer(buffer_size)
+writer = SummaryWriter()
 
-    states, actions, rewards, next_states, dones = memory.sample(64)
+# Training function with smooth L1 loss
+def train(q, q_target, memory, optimizer):
+    for _ in range(10):
+        # Sample a batch from memory
+        batch = memory.sample(batch_size)
+        s, a, r, s_prime, done = zip(*batch)
 
-    states = torch.tensor(states, dtype=torch.float32)
-    actions = torch.tensor(actions, dtype=torch.int64).unsqueeze(1)
-    rewards = torch.tensor(rewards, dtype=torch.float32).unsqueeze(1)
-    next_states = torch.tensor(next_states, dtype=torch.float32)
-    dones = torch.tensor(dones, dtype=torch.float32).unsqueeze(1)
+        # Convert to numpy arrays for more efficient tensor creation
+        s = torch.tensor(np.array(s), dtype=torch.float32)
+        s_prime = torch.tensor(np.array(s_prime), dtype=torch.float32)
+        a = torch.tensor(a, dtype=torch.long).unsqueeze(1)
+        r = torch.tensor(r, dtype=torch.float32).unsqueeze(1)
+        done_mask = torch.tensor(done, dtype=torch.float32).unsqueeze(1)
 
-    # Compute Q values
-    current_q_values = policy_net(states).gather(1, actions)
-    next_q_values = target_net(next_states).max(1)[0].unsqueeze(1)
-    target_q_values = rewards + (0.99 * next_q_values * (1 - dones))
+        # Compute Q values from current state
+        q_out = q(s)
+        q_a = q_out.gather(1, a)
 
-    # Compute loss
-    loss = nn.functional.mse_loss(current_q_values, target_q_values)
+        # Compute target Q values using target network
+        max_q_prime = q_target(s_prime).max(1)[0].unsqueeze(1)
+        target = r + gamma * max_q_prime * (1 - done_mask)
 
-    # Optimize the model
-    optimizer.zero_grad()
-    loss.backward()
-    optimizer.step()
+        # Compute loss using Smooth L1 Loss (Huber Loss)
+        loss = F.smooth_l1_loss(q_a, target)
 
-# Custom Acrobot Environment
-class CustomAcrobotEnv(gym.Env):
-    def __init__(self):
-        super().__init__()
-        self.env = gym.make("Acrobot-v1", render_mode="rgb_array")  # Using rgb_array for rendering
-        self.action_space = self.env.action_space
-        self.observation_space = self.env.observation_space
+        # Backpropagation
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
 
-    def reset(self, **kwargs):
-        return self.env.reset(**kwargs)
+# Training loop
+num_episodes = 10000
+episode_rewards = []
 
-    def step(self, action):
-        observation, _, done, truncated, info = self.env.step(action)
-        custom_reward = self.custom_reward(observation)
-        return observation, custom_reward, done, truncated, info
+for episode in range(num_episodes):
+    state, _ = env.reset()
+    total_reward = 0
+    done = False
+    step = 0
 
-    def render(self, mode='human'):
-        return self.env.render(mode)
+    while not done and step < max_episode_length:
+        # Select action using epsilon-greedy policy
+        action = select_action(agent, state, epsilon)
+        next_state, reward, env_done, truncated, _ = env.step(action)
 
-    # Updated reward function with height and velocity
-    def custom_reward(self, observation):
-        # Cosine of the first and second link angles (height-related)
-        first_link_cos = observation[0]
-        second_link_cos = observation[1]
+        done = done or env_done or truncated
+        replay_buffer.add((state, action, reward, next_state, done))
+        state = next_state
+        total_reward += reward
+        step += 1
 
-        # Approximate height of the end effector
-        height = -(first_link_cos + second_link_cos)
+        # Perform optimization steps
+        if len(replay_buffer) >= batch_size:
+            train(agent, target_agent, replay_buffer, optimizer)
 
-        # Reward for moving the end effector higher
-        height_reward = height * 200  # Stronger reward for upward movement
+        # Sync the target network
+        if step % sync_target_steps == 0:
+            target_agent.load_state_dict(agent.state_dict())
 
-        # Encourage faster upward swinging
-        angular_velocity_1 = observation[4]  # Angular velocity of the first link
-        angular_velocity_2 = observation[5]  # Angular velocity of the second link
-        velocity_reward = (angular_velocity_1 + angular_velocity_2) * 5  # Reduce scaling to avoid instability
+    # Epsilon decay for exploration-exploitation balance
+    if epsilon > epsilon_min:
+        epsilon = max(epsilon_min, epsilon * epsilon_decay)
 
-        # Small penalty to avoid long episodes without progress
-        step_penalty = -1
+    episode_rewards.append(total_reward)
+    writer.add_scalar('Reward/train', total_reward, episode)
+    print(f"Episode {episode}, Total Reward: {total_reward:.2f}, Epsilon: {epsilon:.3f}")
 
-        # Combine components for final reward
-        return height_reward + velocity_reward + step_penalty
-
-# Main training loop
-def train_dqn():
-    env = CustomAcrobotEnv()
-    input_dim = env.observation_space.shape[0]
-    output_dim = env.action_space.n
-
-    policy_net = DQN(input_dim, output_dim)
-    target_net = DQN(input_dim, output_dim)
-    target_net.load_state_dict(policy_net.state_dict())
-    target_net.eval()
-
-    optimizer = optim.Adam(policy_net.parameters(), lr=0.001)
-    memory = ReplayBuffer(10000)
-    epsilon = 1.0
-    epsilon_min = 0.01
-    epsilon_decay = 0.99995  # Extremely slow decay for more exploration
-
-    writer = SummaryWriter(log_dir='./ppo_acrobot_tensorboard/')  # TensorBoard writer
-
-    num_episodes = 2000  # Increased number of episodes
-    for episode in range(num_episodes):
-        state, info = env.reset(seed=42)
-        total_reward = 0
-        done = False
-
-        for t in range(1000):
-            action = select_action(state, policy_net, epsilon, env)
-            next_state, reward, done, truncated, _ = env.step(action)
-            memory.push(state, action, reward, next_state, done)
-            state = next_state
-            total_reward += reward
-
-            optimize_model(memory, policy_net, target_net, optimizer)
-
-            if done:
-                break
-
-        # Epsilon decay
-        epsilon = max(epsilon_min, epsilon_decay * epsilon)
-
-        # Update the target network periodically
-        if episode % 10 == 0:
-            target_net.load_state_dict(policy_net.state_dict())
-
-        # Log progress to TensorBoard
-        writer.add_scalar('Reward', total_reward, episode)
-        writer.add_scalar('Epsilon', epsilon, episode)
-
-        # Log Q-values for analysis
-        state_tensor = torch.tensor(state, dtype=torch.float32).unsqueeze(0)
-        q_values = policy_net(state_tensor)
-        writer.add_scalar('Q-Values', q_values.mean().item(), episode)
-
-        print(f"Episode {episode}, Total Reward: {total_reward}, Epsilon: {epsilon:.3f}")
-
-    # Save the model after training
-    torch.save(policy_net.state_dict(), "dqn_acrobot.pth")
-
-    writer.close()  # Close TensorBoard writer
-    env.close()
-
-if __name__ == "__main__":
-    train_dqn()
+# Close environment and TensorBoard writer
+env.close()
+writer.close()
